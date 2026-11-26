@@ -148,7 +148,7 @@ pub const StreamHandler = struct {
         }
     }
 
-    inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+    pub inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }

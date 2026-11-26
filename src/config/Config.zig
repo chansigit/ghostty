@@ -1465,6 +1465,29 @@ scrollbar: Scrollbar = .system,
 /// TODO: This can't currently be set!
 link: RepeatableLink = .{},
 
+/// Automatically send text to the terminal when the text before the cursor
+/// matches a regular expression. This is similar to iTerm2's "Send Text"
+/// triggers and can be used to answer prompts such as `Password:`.
+///
+/// The format is `REGEX=>TEXT`, split at the first `=>`. The regex is an
+/// Oniguruma regular expression matched against the text on the cursor's
+/// line that is before the cursor, so anchor prompts with `$`. The TEXT
+/// supports the escapes `\n`, `\r`, `\t`, `\e`, `\\` and `\xNN`. Nothing is
+/// appended automatically, so end the text with `\r` to press enter.
+///
+/// A trigger fires once per match. It fires again only after the cursor
+/// line has stopped matching (for example after you press enter).
+///
+/// This can be repeated to add multiple triggers. An empty value clears
+/// all triggers. Example:
+///
+///     trigger = (?i)password.*:\s*$=>hunter2\r
+///
+/// WARNING: The text is stored in plain text in your config file and is
+/// sent to whatever program is running, so only use this for things you
+/// are comfortable storing that way.
+trigger: RepeatableTrigger = .{},
+
 /// Enable URL matching. URLs are matched on hover with control (Linux) or
 /// command (macOS) pressed and open using the default system application for
 /// the linked URL.
@@ -8853,6 +8876,116 @@ pub const RepeatableLink = struct {
         _ = formatter;
     }
 };
+
+/// See "trigger" for documentation.
+pub const RepeatableTrigger = struct {
+    const Self = @This();
+
+    pub const Item = struct {
+        /// The regular expression source.
+        regex: []const u8,
+        /// The text to send, with escapes already decoded.
+        text: []const u8,
+    };
+
+    list: std.ArrayList(Item) = .empty,
+
+    pub fn parseCLI(self: *Self, alloc: Allocator, input_: ?[]const u8) !void {
+        const input = input_ orelse return error.ValueRequired;
+
+        // Empty value resets the list.
+        if (input.len == 0) {
+            self.list.clearRetainingCapacity();
+            return;
+        }
+
+        const idx = std.mem.indexOf(u8, input, "=>") orelse
+            return error.InvalidValue;
+        const regex = input[0..idx];
+        if (regex.len == 0) return error.InvalidValue;
+
+        const text = try unescape(alloc, input[idx + 2 ..]);
+        try self.list.append(alloc, .{
+            .regex = try alloc.dupe(u8, regex),
+            .text = text,
+        });
+    }
+
+    fn unescape(alloc: Allocator, raw: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            const ch = raw[i];
+            if (ch != '\\' or i + 1 >= raw.len) {
+                try out.append(alloc, ch);
+                continue;
+            }
+            i += 1;
+            switch (raw[i]) {
+                'n' => try out.append(alloc, '\n'),
+                'r' => try out.append(alloc, '\r'),
+                't' => try out.append(alloc, '\t'),
+                'e' => try out.append(alloc, 0x1b),
+                '\\' => try out.append(alloc, '\\'),
+                'x' => {
+                    if (i + 3 > raw.len) return error.InvalidValue;
+                    const byte = std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16) catch
+                        return error.InvalidValue;
+                    try out.append(alloc, byte);
+                    i += 2;
+                },
+                else => return error.InvalidValue,
+            }
+        }
+        return try out.toOwnedSlice(alloc);
+    }
+
+    /// Deep copy of the struct. Required by Config.
+    pub fn clone(self: *const Self, alloc: Allocator) Allocator.Error!Self {
+        var list = try std.ArrayList(Item).initCapacity(alloc, self.list.items.len);
+        for (self.list.items) |item| list.appendAssumeCapacity(.{
+            .regex = try alloc.dupe(u8, item.regex),
+            .text = try alloc.dupe(u8, item.text),
+        });
+        return .{ .list = list };
+    }
+
+    /// Compare if two of our value are equal. Required by Config.
+    pub fn equal(self: Self, other: Self) bool {
+        if (self.list.items.len != other.list.items.len) return false;
+        for (self.list.items, other.list.items) |a, b| {
+            if (!std.mem.eql(u8, a.regex, b.regex)) return false;
+            if (!std.mem.eql(u8, a.text, b.text)) return false;
+        }
+        return true;
+    }
+
+    /// Used by Formatter. Triggers can contain secrets and the text is
+    /// stored decoded, so we don't write them back out.
+    pub fn formatEntry(self: Self, formatter: formatterpkg.EntryFormatter) !void {
+        _ = self;
+        _ = formatter;
+    }
+};
+
+test "RepeatableTrigger: parse and unescape" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var list: RepeatableTrigger = .{};
+    try list.parseCLI(alloc, "(?=x)password:\\s*$=>p=>w\\r\\x41");
+    try testing.expectEqual(@as(usize, 1), list.list.items.len);
+    try testing.expectEqualStrings("(?=x)password:\\s*$", list.list.items[0].regex);
+    try testing.expectEqualStrings("p=>w\r\x41", list.list.items[0].text);
+
+    try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "noarrow"));
+    try testing.expectError(error.InvalidValue, list.parseCLI(alloc, "a=>\\xZ"));
+    try list.parseCLI(alloc, "");
+    try testing.expectEqual(@as(usize, 0), list.list.items.len);
+}
 
 /// Options for copy on select behavior.
 pub const CopyOnSelect = enum {

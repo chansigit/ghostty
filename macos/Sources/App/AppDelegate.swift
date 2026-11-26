@@ -229,6 +229,16 @@ class AppDelegate: NSObject,
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Add a "Triggers…" item below Preferences.
+        if let prefs = self.menuOpenConfig, let menu = prefs.menu {
+            let item = NSMenuItem(
+                title: "Triggers…",
+                action: #selector(showTriggers(_:)),
+                keyEquivalent: "")
+            item.target = self
+            menu.insertItem(item, at: menu.index(of: prefs) + 1)
+        }
+
         // System settings overrides
         UserDefaults.ghostty.register(defaults: [
             // Disable this so that repeated key events make it through to our terminal views.
@@ -1030,6 +1040,10 @@ class AppDelegate: NSObject,
 
     @IBAction func openConfig(_ sender: Any?) {
         ghostty.openConfig()
+    }
+
+    @IBAction func showTriggers(_ sender: Any?) {
+        TriggersController.shared.show()
     }
 
     @IBAction func reloadConfig(_ sender: Any?) {

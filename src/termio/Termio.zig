@@ -22,6 +22,7 @@ const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_file = @import("../lib/compat/file.zig");
+const oni = @import("oniguruma");
 
 const log = std.log.scoped(.io_exec);
 
@@ -197,6 +198,9 @@ pub const DerivedConfig = struct {
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
 
+    /// Compiled output triggers (see the `trigger` config).
+    triggers: []Trigger,
+
     pub fn init(
         alloc_gpa: Allocator,
         config: *const configpkg.Config,
@@ -220,6 +224,27 @@ pub const DerivedConfig = struct {
             break :palette config.palette.value;
         };
 
+        // Compile triggers. Invalid regexes are logged and skipped.
+        var triggers: std.ArrayList(Trigger) = .empty;
+        errdefer for (triggers.items) |*t| t.regex.deinit();
+        for (config.trigger.list.items) |item| {
+            var regex = oni.Regex.init(
+                item.regex,
+                .{},
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("invalid trigger regex err={}", .{err});
+                continue;
+            };
+            errdefer regex.deinit();
+            try triggers.append(alloc, .{
+                .regex = regex,
+                .text = try alloc.dupe(u8, item.text),
+            });
+        }
+
         return .{
             .palette = palette,
             .image_storage_limit = config.@"image-storage-limit",
@@ -235,6 +260,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .conditional_state = config._conditional_state,
+            .triggers = triggers.items,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -243,9 +269,69 @@ pub const DerivedConfig = struct {
     }
 
     pub fn deinit(self: *DerivedConfig) void {
+        for (self.triggers) |*t| t.regex.deinit();
         self.arena.deinit();
     }
 };
+
+/// A compiled output trigger. See the `trigger` config.
+pub const Trigger = struct {
+    regex: oni.Regex,
+    text: []const u8,
+
+    /// True when the trigger already fired for the current matching
+    /// line. Cleared once the line stops matching.
+    fired: bool = false,
+};
+
+/// Check triggers against the text before the cursor and queue any
+/// matching text to the pty. Renderer state lock must be held.
+fn checkTriggers(self: *Termio) void {
+    const triggers = self.config.triggers;
+    if (triggers.len == 0) return;
+
+    const screen = self.terminal.screens.active;
+    if (self.terminal.screens.active_key != .primary) {
+        // Alternate screen apps (vim, etc.) shouldn't get auto input.
+        for (triggers) |*t| t.fired = false;
+        return;
+    }
+    const cx = screen.cursor.x;
+    if (cx == 0) {
+        for (triggers) |*t| t.fired = false;
+        return;
+    }
+
+    const cy = screen.cursor.y;
+    const start = screen.pages.pin(.{ .active = .{ .x = 0, .y = cy } }) orelse return;
+    const end = screen.pages.pin(.{ .active = .{ .x = cx - 1, .y = cy } }) orelse return;
+    const line = screen.selectionString(self.alloc, .{
+        .sel = terminalpkg.Selection.init(start, end, false),
+        .trim = false,
+    }) catch return;
+    defer self.alloc.free(line);
+
+    for (triggers) |*t| {
+        var match_param = oni.MatchParam.init() catch continue;
+        defer match_param.deinit();
+        match_param.setRetryLimitInSearch(100_000) catch {};
+
+        var region = t.regex.searchWithParam(line, .{}, &match_param) catch {
+            t.fired = false;
+            continue;
+        };
+        region.deinit();
+
+        if (t.fired) continue;
+        t.fired = true;
+
+        const msg = termio.Message.writeReq(self.alloc, t.text) catch |err| {
+            log.warn("trigger write failed err={}", .{err});
+            continue;
+        };
+        self.terminal_stream.handler.messageWriter(msg);
+    }
+}
 
 /// Initialize the termio state.
 ///
@@ -752,6 +838,8 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     } else {
         self.terminal_stream.nextSlice(buf);
     }
+
+    self.checkTriggers();
 
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.
