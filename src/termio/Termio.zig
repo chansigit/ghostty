@@ -22,6 +22,7 @@ const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_file = @import("../lib/compat/file.zig");
+const Trigger = @import("Trigger.zig");
 
 const log = std.log.scoped(.io_exec);
 
@@ -196,6 +197,7 @@ pub const DerivedConfig = struct {
     xt_checksum_report: bool,
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
+    triggers: []Trigger,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -220,6 +222,17 @@ pub const DerivedConfig = struct {
             break :palette config.palette.value;
         };
 
+        // Invalid triggers are logged and skipped.
+        var triggers: std.ArrayList(Trigger) = .empty;
+        errdefer for (triggers.items) |*t| t.deinit();
+        for (config.trigger.list.items) |value| {
+            const t = Trigger.init(alloc, value) catch |err| {
+                log.warn("invalid trigger err={}", .{err});
+                continue;
+            };
+            try triggers.append(alloc, t);
+        }
+
         return .{
             .palette = palette,
             .image_storage_limit = config.@"image-storage-limit",
@@ -235,6 +248,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .conditional_state = config._conditional_state,
+            .triggers = triggers.items,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -243,9 +257,49 @@ pub const DerivedConfig = struct {
     }
 
     pub fn deinit(self: *DerivedConfig) void {
+        for (self.triggers) |*t| t.deinit();
         self.arena.deinit();
     }
 };
+
+/// Returns the text on the cursor row before the cursor, or null if
+/// triggers shouldn't run (alternate screen or cursor at column zero).
+/// The renderer state lock must be held.
+fn cursorLine(self: *Termio) ?[:0]const u8 {
+    if (self.terminal.screens.active_key != .primary) return null;
+
+    const screen = self.terminal.screens.active;
+    const cursor = screen.cursor;
+    if (cursor.x == 0) return null;
+
+    const start = screen.pages.pin(.{ .active = .{ .x = 0, .y = cursor.y } }) orelse return null;
+    const end = screen.pages.pin(.{ .active = .{ .x = cursor.x - 1, .y = cursor.y } }) orelse return null;
+    return screen.selectionString(self.alloc, .{
+        .sel = .init(start, end, false),
+        .trim = false,
+    }) catch null;
+}
+
+/// Send the text of any trigger that newly matches the cursor line.
+/// The renderer state lock must be held.
+fn checkTriggers(self: *Termio) void {
+    if (self.config.triggers.len == 0) return;
+
+    const line = self.cursorLine();
+    defer if (line) |l| self.alloc.free(l);
+
+    for (self.config.triggers) |*t| {
+        const matched = if (line) |l| t.matches(l) else false;
+        defer t.fired = matched;
+        if (!matched or t.fired) continue;
+
+        const msg = termio.Message.writeReq(self.alloc, t.text) catch |err| {
+            log.warn("trigger write failed err={}", .{err});
+            continue;
+        };
+        self.queueMessage(msg, .locked);
+    }
+}
 
 /// Initialize the termio state.
 ///
@@ -752,6 +806,8 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     } else {
         self.terminal_stream.nextSlice(buf);
     }
+
+    self.checkTriggers();
 
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.

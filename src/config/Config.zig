@@ -1465,6 +1465,26 @@ scrollbar: Scrollbar = .system,
 /// TODO: This can't currently be set!
 link: RepeatableLink = .{},
 
+/// Send text to the terminal when the text before the cursor matches a
+/// regular expression. This can be used to answer prompts such as
+/// `Password:`.
+///
+/// The format is `REGEX=>TEXT`, split at the first `=>`. REGEX is an
+/// Oniguruma regular expression matched against the cursor's line up to the
+/// cursor, so anchor prompts with `$`. TEXT supports Zig string escapes such
+/// as `\n`, `\r` and `\x1b`. Nothing is appended automatically, so end TEXT
+/// with `\r` to press enter.
+///
+/// A trigger fires once per match and fires again only after the cursor line
+/// stops matching. Triggers are ignored on the alternate screen.
+///
+/// This can be repeated. An empty value clears all triggers. Example:
+///
+///     trigger = (?i)password.*:\s*$=>hunter2\r
+///
+/// WARNING: TEXT is stored in plain text in your config file.
+trigger: RepeatableString = .{},
+
 /// Enable URL matching. URLs are matched on hover with control (Linux) or
 /// command (macOS) pressed and open using the default system application for
 /// the linked URL.
