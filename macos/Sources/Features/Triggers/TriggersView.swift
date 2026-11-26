@@ -25,7 +25,7 @@ struct TriggersView: View {
                 if let errorMessage {
                     Text(errorMessage).foregroundColor(.red).font(.caption)
                 }
-                Button("Close") { apply(); onClose() }
+                Button("Close") { onClose() }
                 Button("Apply") { apply() }
                     .keyboardShortcut(.defaultAction)
             }
@@ -40,7 +40,8 @@ struct TriggersView: View {
             ForEach(store.items) { item in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 4) {
-                        Image(systemName: "bolt.fill").font(.caption)
+                        Image(systemName: item.problem == nil ? "bolt.fill" : "exclamationmark.triangle.fill")
+                            .font(.caption)
                         Text(item.name.isEmpty ? "(unnamed)" : item.name).bold()
                     }
                     Text("/\(item.regex)/")
@@ -73,6 +74,9 @@ struct TriggersView: View {
                      "End the text with \\r to press Return.")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                if let problem = item.wrappedValue.problem {
+                    Text(problem).font(.caption).foregroundColor(.red)
+                }
                 Text("Text is stored in plain text in your config directory.")
                     .font(.caption)
                     .foregroundColor(.secondary)

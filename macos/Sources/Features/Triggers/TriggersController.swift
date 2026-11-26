@@ -50,6 +50,12 @@ final class TriggersController: NSWindowController, NSWindowDelegate {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// Closing by any route saves, so the red button and Close agree.
+    func windowWillClose(_ notification: Notification) {
+        guard (try? store.save()) != nil else { return }
+        (NSApp.delegate as? AppDelegate)?.reloadConfig(nil)
+    }
+
     func show() {
         store.load()
         showWindow(nil)
