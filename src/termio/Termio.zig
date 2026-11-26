@@ -262,22 +262,38 @@ pub const DerivedConfig = struct {
     }
 };
 
-/// Returns the text on the cursor row before the cursor, or null if
-/// triggers shouldn't run (alternate screen or cursor at column zero).
+/// How many soft-wrapped rows above the cursor are read as part of its line.
+const max_trigger_wrapped_rows = 8;
+
+/// Returns the text on the cursor's line before the cursor, or null if
+/// triggers shouldn't run (alternate screen or nothing before the cursor).
 /// The renderer state lock must be held.
-fn cursorLine(self: *Termio) ?[:0]const u8 {
+fn cursorLine(self: *Termio, alloc: Allocator) Allocator.Error!?[:0]const u8 {
     if (self.terminal.screens.active_key != .primary) return null;
 
     const screen = self.terminal.screens.active;
     const cursor = screen.cursor;
-    if (cursor.x == 0) return null;
 
-    const start = screen.pages.pin(.{ .active = .{ .x = 0, .y = cursor.y } }) orelse return null;
-    const end = screen.pages.pin(.{ .active = .{ .x = cursor.x - 1, .y = cursor.y } }) orelse return null;
-    return screen.selectionString(self.alloc, .{
+    // With a pending wrap the cursor sits on the last written cell, so
+    // that cell is part of the text too.
+    const len = if (cursor.pending_wrap) cursor.x + 1 else cursor.x;
+    if (len == 0) return null;
+
+    var start = screen.pages.pin(.{ .active = .{ .x = 0, .y = cursor.y } }) orelse return null;
+    const end = screen.pages.pin(.{ .active = .{ .x = len - 1, .y = cursor.y } }) orelse return null;
+
+    // A soft-wrapped prompt starts on an earlier row. The selection
+    // string unwraps the rows for us.
+    for (0..max_trigger_wrapped_rows) |_| {
+        const prev = start.up(1) orelse break;
+        if (!prev.rowAndCell().row.wrap) break;
+        start = prev;
+    }
+
+    return try screen.selectionString(alloc, .{
         .sel = .init(start, end, false),
         .trim = false,
-    }) catch null;
+    });
 }
 
 /// Send the text of any trigger that newly matches the cursor line.
@@ -285,9 +301,22 @@ fn cursorLine(self: *Termio) ?[:0]const u8 {
 fn checkTriggers(self: *Termio) void {
     if (self.config.triggers.len == 0) return;
 
-    const line = self.cursorLine();
-    defer if (line) |l| self.alloc.free(l);
+    // This runs for every chunk of output, so keep the common case (a
+    // line that fits on the stack) free of heap allocations.
+    var buf: [512]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var line_alloc = fba.allocator();
+    const line = self.cursorLine(line_alloc) catch heap: {
+        line_alloc = self.alloc;
+        break :heap self.cursorLine(line_alloc) catch null;
+    };
+    defer if (line) |l| line_alloc.free(l);
 
+    // Queueing can release the lock when the mailbox is full, and a config
+    // change could then free the triggers. So build every message first
+    // (they own a copy of the text) and only then send them.
+    var msgs: std.ArrayList(termio.Message) = .empty;
+    defer msgs.deinit(self.alloc);
     for (self.config.triggers) |*t| {
         const matched = if (line) |l| t.matches(l) else false;
         defer t.fired = matched;
@@ -297,8 +326,13 @@ fn checkTriggers(self: *Termio) void {
             log.warn("trigger write failed err={}", .{err});
             continue;
         };
-        self.queueMessage(msg, .locked);
+        msgs.append(self.alloc, msg) catch {
+            msg.deinit();
+            continue;
+        };
     }
+
+    for (msgs.items) |msg| self.queueMessage(msg, .locked);
 }
 
 /// Initialize the termio state.

@@ -40,9 +40,17 @@ pub fn deinit(self: *Trigger) void {
     self.regex.deinit();
 }
 
+/// Bounds the backtracking work of one search. Matching runs with the
+/// renderer lock held, so a pathological regex must not stall the terminal.
+const search_retry_limit = 100_000;
+
 /// Returns true if the regex matches anywhere in the given line.
 pub fn matches(self: *Trigger, line: []const u8) bool {
-    var region = self.regex.search(line, .{}) catch return false;
+    var param = oni.MatchParam.init() catch return false;
+    defer param.deinit();
+    param.setRetryLimitInSearch(search_retry_limit) catch return false;
+
+    var region = self.regex.searchWithParam(line, .{}, &param) catch return false;
     region.deinit();
     return true;
 }
